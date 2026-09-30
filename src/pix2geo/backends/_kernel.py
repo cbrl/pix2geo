@@ -1,10 +1,14 @@
-"""Ray / heightfield intersection kernel, shared by the CPU backends.
+"""Ray / heightfield intersection kernel, shared by all the backends.
 
-The kernel is plain Python in the subset that Numba compiles. The function
-:func:`build_kernels` makes the kernel with a given ``jit`` decorator. The
-Numba backend passes ``numba.njit``. The Python backend passes an identity
-decorator, so both backends run the same algorithm. The CuPy backend is a
-line-by-line CUDA port.
+The kernel is plain Python in the subset that both Numba and ``cupyx.jit``
+compile. The function :func:`build_kernels` makes the kernel with a given
+``jit`` decorator, so all the backends run the same algorithm:
+
+* The Python backend passes an identity decorator.
+* The Numba backend passes ``numba.njit``.
+* The CuPy backend passes ``cupyx.jit.rawkernel(device=True)``. It also
+  passes CuPy ufuncs in place of the ``math`` module, because ``cupyx.jit``
+  cannot compile ``math`` functions. See :class:`KernelMath`.
 
 Algorithm
 ---------
@@ -28,6 +32,11 @@ segment, the kernel:
 The visit order is near-to-far, so the first leaf hit is the nearest hit.
 The kernel maps the hit back onto the exact ECEF ray parameter.
 
+Step 1 uses float64. Step 2 uses the number types ``real`` and ``index``
+that the backend gives (float32 and int32 on the GPU), with grid coordinates
+relative to a grid point near the segment start. Small coordinates keep the
+float32 error small, also on large rasters.
+
 Grid mapping
 ------------
 ``params`` is a float64 vector that :func:`make_grid_params` makes:
@@ -40,8 +49,10 @@ Grid mapping
   ``MODE_LUT`` when ``(u, v)`` address the lookup tables ``lut_x`` and
   ``lut_y``, which hold grid coordinates on a regular lon/lat lattice (for
   projected CRSs).
-* ``params[P_A]``, ``params[P_E2]``: ellipsoid semi-major axis and first
-  eccentricity squared.
+* ``params[P_A]``, ``params[P_B]``, ``params[P_E2]``, ``params[P_EP2]``:
+  ellipsoid semi-major and semi-minor axes, and first and second
+  eccentricity squared. The kernel gets all four, so it does not compute
+  ``b`` and ``ep2`` for each point.
 """
 
 from __future__ import annotations
@@ -52,7 +63,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple, Protocol, TypeVar
 
 import numpy as np
 
-from .._geodesy import WGS84_A, WGS84_E2
+from .._geodesy import WGS84_A, WGS84_B, WGS84_E2, WGS84_EP2
 from .._typing import (
     FloatArray,
     GridLut,
@@ -75,6 +86,25 @@ class Decorator(Protocol):
     """A function decorator that keeps the signature, such as ``numba.njit(...)``."""
 
     def __call__(self, func: _F, /) -> _F: ...
+
+
+class KernelMath(Protocol):
+    """The math functions that the kernel calls. The ``math`` module has all of them."""
+
+    @property
+    def nan(self) -> float: ...
+
+    def sqrt(self, x: float, /) -> float: ...
+
+    def sin(self, x: float, /) -> float: ...
+
+    def cos(self, x: float, /) -> float: ...
+
+    def atan2(self, y: float, x: float, /) -> float: ...
+
+    def degrees(self, x: float, /) -> float: ...
+
+    def isfinite(self, x: float, /) -> bool: ...
 
 
 #: Signature of the ``trace_rays`` kernel: terrain arrays, then the ray batch,
@@ -116,8 +146,10 @@ P_AFFINE = 0
 P_WRAP = 6
 P_MODE = 7
 P_A = 8
-P_E2 = 9
-N_PARAMS = 10
+P_B = 9
+P_E2 = 10
+P_EP2 = 11
+N_PARAMS = 12
 
 MODE_AFFINE = 0.0
 MODE_LUT = 1.0
@@ -132,7 +164,9 @@ def make_grid_params(
     params[P_WRAP] = np.nan if wrap_center is None else wrap_center
     params[P_MODE] = MODE_LUT if use_lut else MODE_AFFINE
     params[P_A] = WGS84_A
+    params[P_B] = WGS84_B
     params[P_E2] = WGS84_E2
+    params[P_EP2] = WGS84_EP2
     return params
 
 
@@ -170,11 +204,23 @@ def build_kernels(
     jit: Decorator,
     jit_parallel: Decorator,
     prange: Callable[[int], Iterable[int]],
+    math: KernelMath = math,
+    real: Callable[[Any], float] = float,
+    index: Callable[[Any], int] = int,
 ) -> Kernels:
     """Make the kernel functions with the given decorators and parallel range.
 
     ``jit`` compiles the per-ray functions. ``jit_parallel`` compiles
-    ``trace_rays``, whose ray loop uses ``prange``.
+    ``trace_rays``, whose ray loop uses ``prange``. ``math`` gives the math
+    functions. The parameter has the name of the module that it replaces, so
+    the kernel code reads as plain Python.
+
+    ``real`` and ``index`` are the float and integer types of the quadtree
+    walk (``trace_segment`` and ``bilinear_hit``). The CPU backends use
+    ``float`` and ``int`` (64 bits). The CuPy backend uses float32 and int32,
+    because consumer GPUs run 64-bit math much more slowly. The integer
+    arrays of the walk (``shp`` and ``stack``) should have the type
+    ``index`` too. The geodetic math always uses float64.
     """
 
     @jit
@@ -182,8 +228,8 @@ def build_kernels(
         hgt: HeightGrid,
         i: int,
         j: int,
-        x0: float,
-        y0: float,
+        u0: float,
+        v0: float,
         z0: float,
         dx: float,
         dy: float,
@@ -191,20 +237,18 @@ def build_kernels(
         ta: float,
         tb: float,
     ) -> float:
-        # Smallest t in [ta, tb] where the segment (x0, y0, z0) + t (dx, dy, dz)
-        # is on or below the bilinear patch of cell (i, j). Returns -1.0 if there
-        # is none.
+        # Smallest t in [ta, tb] where the segment (u0, v0, z0) + t (dx, dy, dz)
+        # is on or below the bilinear patch of cell (i, j). (u0, v0) is the
+        # segment start relative to the cell corner. Returns -1.0 if there is none.
 
         # The four corner posts of the cell.
-        h00 = float(hgt[i, j])
-        h10 = float(hgt[i, j + 1])
-        h01 = float(hgt[i + 1, j])
-        h11 = float(hgt[i + 1, j + 1])
+        h00 = real(hgt[i, j])
+        h10 = real(hgt[i, j + 1])
+        h01 = real(hgt[i + 1, j])
+        h11 = real(hgt[i + 1, j + 1])
 
         # The patch is H(u, v) = h00 + b u + c v + d u v, where (u, v) is the
-        # position in the cell. The segment starts at (u0, v0).
-        u0 = x0 - j
-        v0 = y0 - i
+        # position in the cell.
         b = h10 - h00
         c = h01 - h00
         d = h00 - h10 - h01 + h11
@@ -282,6 +326,8 @@ def build_kernels(
         pyr: PyramidData,
         offs: LevelOffsets,
         shp: LevelShapes,
+        row0: int,
+        col0: int,
         x0: float,
         y0: float,
         z0: float,
@@ -292,6 +338,9 @@ def build_kernels(
     ) -> float:
         # First hit parameter t in [0, 1] on the grid-space segment from
         # (x0, y0, z0) to (x1, y1, z1), or -1.0. The caller owns the stack.
+        # (x, y) are grid coordinates relative to the grid point (col0, row0).
+        # An origin near the segment keeps them small, so float32 keeps its
+        # precision on large rasters.
         dx = x1 - x0
         dy = y1 - y0
         dz = z1 - z0
@@ -316,11 +365,12 @@ def build_kernels(
             i = stack[sp, 1]
             j = stack[sp, 2]
 
-            # The footprint of the node: 2^k x 2^k cells, in grid coordinates.
-            xlo = float(j << k)
-            xhi = float(min((j + 1) << k, cols))
-            ylo = float(i << k)
-            yhi = float(min((i + 1) << k, rows))
+            # The footprint of the node: 2^k x 2^k cells, relative to the origin.
+            # The integer subtraction is exact.
+            xlo = real((j << k) - col0)
+            xhi = real(min((j + 1) << k, cols) - col0)
+            ylo = real((i << k) - row0)
+            yhi = real(min((i + 1) << k, rows) - row0)
 
             # Clip the segment to the footprint. Skip the node if the segment misses it.
             ta, tb = clip_slab(x0, dx, xlo, xhi, 0.0, 1.0)
@@ -336,9 +386,10 @@ def build_kernels(
             if zmin > pyr[offs[k] + i * shp[k, 1] + j]:
                 continue
 
-            # A leaf is one cell: do the exact test on its bilinear patch.
+            # A leaf is one cell: do the exact test on its bilinear patch. The
+            # footprint corner (xlo, ylo) is the cell corner.
             if k == 0:
-                t = bilinear_hit(hgt, i, j, x0, y0, z0, dx, dy, dz, ta, tb)
+                t = bilinear_hit(hgt, i, j, x0 - xlo, y0 - ylo, z0, dx, dy, dz, ta, tb)
                 if t >= 0.0:
                     return t
                 continue
@@ -361,45 +412,72 @@ def build_kernels(
 
     @jit
     def ecef_to_geodetic(
-        x: float, y: float, z: float, a: float, e2: float
+        x: float,
+        y: float,
+        z: float,
+        a: float,
+        b: float,
+        e2: float,
+        ep2: float,
     ) -> tuple[float, float, float]:
         # Bowring's method with two iterations. Returns the latitude and the
-        # longitude in radians and the height in metres.
+        # longitude in radians and the height in meters. The ellipsoid has the
+        # semi-axes a and b, and the first and second eccentricity squared e2
+        # and ep2. Each angle comes from its tangent, as a sine and cosine pair.
+        # Only the final angles need atan2, so the method uses no sin or cos.
+        # Those are slow in float64 on GPUs.
 
-        # The semi-minor axis b, the second eccentricity squared ep2, and the
-        # distance p from the polar axis.
-        b = a * math.sqrt(1.0 - e2)
-        ep2 = e2 / (1.0 - e2)
+        # The distance from the polar axis.
         p = math.sqrt(x * x + y * y)
 
-        # The longitude is exact. The first guess of the reduced latitude beta
-        # comes from the point as if it were on the ellipsoid.
+        # The first guess of the reduced latitude beta comes from the point as if
+        # it were on the ellipsoid: tan(beta) = (a z) / (b p).
+        sn = a * z
+        cs = b * p
+        inv = 1.0 / math.sqrt(sn * sn + cs * cs)
+        sb = sn * inv
+        cb = cs * inv
+
+        # Iteration 1: the latitude from beta, as tan(lat) = num / den. Then
+        # beta from the latitude, as tan(beta) = (b / a) tan(lat).
+        num = z + ep2 * b * sb * sb * sb
+        den = p - e2 * a * cb * cb * cb
+        sn = b * num
+        cs = a * den
+        inv = 1.0 / math.sqrt(sn * sn + cs * cs)
+        sb = sn * inv
+        cb = cs * inv
+
+        # Iteration 2: the final latitude, with its sine and cosine.
+        num = z + ep2 * b * sb * sb * sb
+        den = p - e2 * a * cb * cb * cb
+        inv = 1.0 / math.sqrt(num * num + den * den)
+        sl = num * inv
+        cl = den * inv
+
+        # The longitude is exact. The height is along the ellipsoid normal. This
+        # form is stable at all latitudes, also near the poles.
+        lat = math.atan2(num, den)
         lon = math.atan2(y, x)
-        beta = math.atan2(z * a, p * b)
-        lat = 0.0
-
-        # Each iteration gets the latitude from beta, then beta from the latitude.
-        for _ in range(2):
-            sb = math.sin(beta)
-            cb = math.cos(beta)
-            lat = math.atan2(z + ep2 * b * sb * sb * sb, p - e2 * a * cb * cb * cb)
-            beta = math.atan2(b * math.sin(lat), a * math.cos(lat))
-
-        # The height along the ellipsoid normal. This form is stable at all
-        # latitudes, also near the poles.
-        sl = math.sin(lat)
-        h = p * math.cos(lat) + z * sl - a * math.sqrt(1.0 - e2 * sl * sl)
+        h = p * cl + z * sl - a * math.sqrt(1.0 - e2 * sl * sl)
 
         return lat, lon, h
 
     @jit
     def ecef_to_grid(
-        x: float, y: float, z: float, params: GridParams, lut_x: GridLut, lut_y: GridLut
+        x: float,
+        y: float,
+        z: float,
+        params: GridParams,
+        lut_x: GridLut,
+        lut_y: GridLut,
     ) -> tuple[float, float, float]:
         # ECEF point to grid coordinates (x, y) and ellipsoidal height.
 
         # Geodetic latitude and longitude in degrees.
-        lat, lon, h = ecef_to_geodetic(x, y, z, params[P_A], params[P_E2])
+        lat, lon, h = ecef_to_geodetic(
+            x, y, z, params[P_A], params[P_B], params[P_E2], params[P_EP2]
+        )
         lat = math.degrees(lat)
         lon = math.degrees(lon)
 
@@ -460,6 +538,10 @@ def build_kernels(
         # Ray parameter of the first hit of the ECEF ray (ox, oy, oz) + t (dx, dy, dz)
         # on [t_start, t_end] in nseg segments, or NaN.
 
+        # The raster size in cells.
+        rows = shp[0, 0]
+        cols = shp[0, 1]
+
         # Grid coordinates of the start of the first segment. Each segment end
         # is the start of the next segment, so each point converts only once.
         step = (t_end - t_start) / nseg
@@ -473,10 +555,30 @@ def build_kernels(
                 ox + tb * dx, oy + tb * dy, oz + tb * dz, params, lut_x, lut_y
             )
 
-            # Skip a segment with an end outside the grid mapping (NaN). The kernel
-            # gives the hit as a fraction of the segment. Convert it to the ray parameter.
-            if math.isfinite(ax) and math.isfinite(ay) and math.isfinite(bx) and math.isfinite(by):
-                t = trace_segment(hgt, pyr, offs, shp, ax, ay, az, bx, by, bz, stack)
+            # Skip a segment with an end outside the grid mapping (NaN), and a
+            # segment with both ends on the same outer side of the raster. Thus
+            # the walk only gets coordinates near the raster, which fit in int32.
+            finite = (
+                math.isfinite(ax) and math.isfinite(ay) and math.isfinite(bx) and math.isfinite(by)
+            )
+            overlaps = (
+                (ax >= 0.0 or bx >= 0.0) and (ax <= cols or bx <= cols)
+                and (ay >= 0.0 or by >= 0.0) and (ay <= rows or by <= rows)
+            )  # fmt: skip
+            if finite and overlaps:
+                # The walk uses grid coordinates relative to the grid point next
+                # to the segment start, in the number types of the walk.
+                col0 = index(ax)
+                row0 = index(ay)
+                t = trace_segment(
+                    hgt, pyr, offs, shp, row0, col0,
+                    real(ax - col0), real(ay - row0), real(az),
+                    real(bx - col0), real(by - row0), real(bz),
+                    stack,
+                )  # fmt: skip
+
+                # The walk gives the hit as a fraction of the segment. Convert it
+                # to the ray parameter.
                 if t >= 0.0:
                     return ta + t * (tb - ta)
 

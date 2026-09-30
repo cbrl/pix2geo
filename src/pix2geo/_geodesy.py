@@ -19,6 +19,9 @@ WGS84_B = WGS84_A * (1.0 - WGS84_F)
 #: WGS84 first eccentricity squared.
 WGS84_E2 = WGS84_F * (2.0 - WGS84_F)
 
+#: WGS84 second eccentricity squared.
+WGS84_EP2 = WGS84_E2 / (1.0 - WGS84_E2)
+
 
 def wrap_lon(lon: ArrayLike, center: float) -> FloatArray:
     """Wrap longitudes in degrees into the interval ``[center - 180, center + 180)``."""

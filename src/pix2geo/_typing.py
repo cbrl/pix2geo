@@ -63,7 +63,7 @@ PyramidData = NDArray[np.float32]
 LevelOffsets = NDArray[np.int64]
 
 #: ``(rows, cols)`` of each quadtree level, shape ``(levels, 2)``. Level 0 is
-#: the cell level.
+#: the cell level. The CuPy backend uploads it as int32.
 LevelShapes = NDArray[np.int64]
 
 #: The packed (lon, lat) to grid mapping, shape ``(N_PARAMS,)``. See
@@ -75,5 +75,6 @@ GridParams = NDArray[np.float64]
 GridLut = NDArray[np.float64]
 
 #: The depth-first traversal stack, shape ``(size, 3)``. Each row is one
-#: quadtree node: ``(level, row, column)``.
-NodeStack = NDArray[np.int64]
+#: quadtree node: ``(level, row, column)``. int64 on the CPU. int32 on the GPU,
+#: where it halves the memory traffic.
+NodeStack = Union[NDArray[np.int64], NDArray[np.int32]]
