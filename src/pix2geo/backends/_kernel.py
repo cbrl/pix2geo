@@ -12,9 +12,10 @@ compile. The function :func:`build_kernels` makes the kernel with a given
 
 Algorithm
 ---------
-Each ray is an exact straight line in ECEF, clipped on the host to the
-height band of the terrain and cut into ``nseg`` equal segments. For each
-segment, the kernel:
+Each ray is an exact straight line in ECEF. The kernel clips it to the
+height band of the terrain (two ray / ellipsoid intersections) and cuts the
+rest into equal segments (see :func:`make_ray_limits`). For each segment,
+the kernel:
 
 1. Converts the segment end point from ECEF to geodetic coordinates
    (Bowring's method, two iterations, sub-micrometre accurate near the
@@ -30,7 +31,8 @@ segment, the kernel:
       intersection. This is a quadratic equation in the segment parameter.
 
 The visit order is near-to-far, so the first leaf hit is the nearest hit.
-The kernel maps the hit back onto the exact ECEF ray parameter.
+The kernel maps the hit back onto the exact ECEF ray parameter, and converts
+the hit point to geodetic coordinates.
 
 Step 1 uses float64. Step 2 uses the number types ``real`` and ``index``
 that the backend gives (float32 and int32 on the GPU), with grid coordinates
@@ -69,11 +71,11 @@ from .._typing import (
     GridLut,
     GridParams,
     HeightGrid,
-    IntArray,
     LevelOffsets,
     LevelShapes,
     NodeStack,
     PyramidData,
+    RayLimits,
 )
 
 if TYPE_CHECKING:
@@ -96,10 +98,6 @@ class KernelMath(Protocol):
 
     def sqrt(self, x: float, /) -> float: ...
 
-    def sin(self, x: float, /) -> float: ...
-
-    def cos(self, x: float, /) -> float: ...
-
     def atan2(self, y: float, x: float, /) -> float: ...
 
     def degrees(self, x: float, /) -> float: ...
@@ -107,8 +105,8 @@ class KernelMath(Protocol):
     def isfinite(self, x: float, /) -> bool: ...
 
 
-#: Signature of the ``trace_rays`` kernel: terrain arrays, then the ray batch,
-#: then the output array for the hit parameters.
+#: Signature of the ``trace_rays`` kernel: terrain arrays, the ray limits,
+#: the ray batch, then the ``(4, n)`` output array for the hits.
 TraceRaysKernel = Callable[
     [
         HeightGrid,
@@ -118,11 +116,9 @@ TraceRaysKernel = Callable[
         GridParams,
         GridLut,
         GridLut,
+        RayLimits,
         FloatArray,
         FloatArray,
-        FloatArray,
-        FloatArray,
-        IntArray,
         FloatArray,
     ],
     None,
@@ -137,7 +133,10 @@ class Kernels(NamedTuple):
     trace_segment: Callable[..., float]
     ecef_to_geodetic: Callable[..., tuple[float, float, float]]
     ecef_to_grid: Callable[..., tuple[float, float, float]]
+    ellipsoid_hits: Callable[..., tuple[float, float]]
+    clip_to_band: Callable[..., tuple[float, float]]
     trace_one: Callable[..., float]
+    trace_ray: Callable[..., None]
     trace_rays: TraceRaysKernel
 
 
@@ -154,9 +153,23 @@ N_PARAMS = 12
 MODE_AFFINE = 0.0
 MODE_LUT = 1.0
 
+# Layout of the ``limits`` vector.
+L_H_MIN = 0
+L_H_MAX = 1
+L_T_MAX = 2
+L_SEGMENT = 3
+N_LIMITS = 4
+
+#: The height band of the terrain grows by this margin (meters) on each side.
+#: It covers the difference between a grown ellipsoid and a surface of
+#: constant height (less than 3 cm below 20 km).
+BAND_MARGIN = 1.0
+
 
 def make_grid_params(
-    affine: Sequence[float], wrap_center: float | None = None, use_lut: bool = False
+    affine: Sequence[float],
+    wrap_center: float | None = None,
+    use_lut: bool = False,
 ) -> GridParams:
     """Pack the (lon, lat) to grid mapping into the ``params`` vector."""
     params = np.empty(N_PARAMS)
@@ -168,6 +181,28 @@ def make_grid_params(
     params[P_E2] = WGS84_E2
     params[P_EP2] = WGS84_EP2
     return params
+
+
+def make_ray_limits(
+    terrain: Terrain,
+    max_range: float | None,
+    max_segment_length: float,
+) -> RayLimits:
+    """Pack the ray clip settings into the ``limits`` vector.
+
+    * ``limits[L_H_MIN]``, ``limits[L_H_MAX]``: the height band of the
+      terrain, with :data:`BAND_MARGIN`. The kernel clips each ray to it.
+    * ``limits[L_T_MAX]``: the largest ray parameter (``max_range``), or
+      infinity for no limit.
+    * ``limits[L_SEGMENT]``: the longest segment (``max_segment_length``).
+    """
+    limits = np.empty(N_LIMITS)
+    limits[L_H_MIN] = terrain.h_min - BAND_MARGIN
+    limits[L_H_MAX] = terrain.h_max + BAND_MARGIN
+    limits[L_T_MAX] = math.inf if max_range is None else max_range
+    limits[L_SEGMENT] = max_segment_length
+
+    return limits
 
 
 def stack_size(num_levels: int) -> int:
@@ -184,17 +219,15 @@ def run_cpu_kernel(
     terrain: Terrain,
     orig: FloatArray,
     dirs: FloatArray,
-    t0: FloatArray,
-    t1: FloatArray,
-    nseg: IntArray,
+    limits: RayLimits,
 ) -> FloatArray:
-    """Call a CPU ``trace_rays`` kernel for one ray batch and return the hit parameters."""
+    """Call a CPU ``trace_rays`` kernel for one ray batch and return the ``(4, n)`` hits."""
     params, lut_x, lut_y = terrain.grid_mapping()
     pyr = terrain.pyramid
-    out = np.empty(len(orig))
+    out = np.empty((4, len(dirs)))
     trace_rays(
         terrain.heights, pyr.data, pyr.offsets, pyr.shapes, params, lut_x, lut_y,
-        orig, dirs, t0, t1, nseg, out,
+        limits, orig, dirs, out,
     )  # fmt: skip
 
     return out
@@ -516,6 +549,81 @@ def build_kernels(
         return gx, gy, h
 
     @jit
+    def ellipsoid_hits(
+        ox: float,
+        oy: float,
+        oz: float,
+        dx: float,
+        dy: float,
+        dz: float,
+        a: float,
+        b: float,
+    ) -> tuple[float, float]:
+        # The ray parameters (t_near, t_far) where the line (ox, oy, oz) + t (dx, dy, dz)
+        # meets the ellipsoid with the semi-axes (a, a, b). NaN when it misses.
+
+        # Scale each axis so that the ellipsoid becomes the unit sphere. Then
+        # |o + t d|^2 = 1 gives the quadratic qa t^2 + qb t + qc = 0.
+        ia = 1.0 / (a * a)
+        ib = 1.0 / (b * b)
+        qa = (dx * dx + dy * dy) * ia + dz * dz * ib
+        qb = 2.0 * ((ox * dx + oy * dy) * ia + oz * dz * ib)
+        qc = (ox * ox + oy * oy) * ia + oz * oz * ib - 1.0
+        disc = qb * qb - 4.0 * qa * qc
+        if not disc >= 0.0:
+            return math.nan, math.nan
+
+        # This form of the quadratic formula prevents cancellation.
+        # The roots are q / qa and qc / q.
+        sq = math.sqrt(disc)
+        q = -0.5 * (qb + sq) if qb >= 0.0 else -0.5 * (qb - sq)
+        r1 = q / qa
+        r2 = qc / q if q != 0.0 else r1
+        if r1 > r2:
+            r1, r2 = r2, r1
+
+        return r1, r2
+
+    @jit
+    def clip_to_band(
+        ox: float,
+        oy: float,
+        oz: float,
+        dx: float,
+        dy: float,
+        dz: float,
+        params: GridParams,
+        limits: RayLimits,
+    ) -> tuple[float, float]:
+        # The ray parameter interval [t0, t1] inside the height band of the
+        # terrain and inside the largest range. This removes the empty space
+        # above the terrain, which can be hundreds of kilometers for a
+        # satellite. The interval is empty (not t1 > t0) when the ray misses
+        # the band.
+
+        # The band is the shell between two grown ellipsoids.
+        a = params[P_A]
+        b = params[P_B]
+        h_min = limits[L_H_MIN]
+        h_max = limits[L_H_MAX]
+        top_in, top_out = ellipsoid_hits(ox, oy, oz, dx, dy, dz, a + h_max, b + h_max)
+        bottom_in, _ = ellipsoid_hits(ox, oy, oz, dx, dy, dz, a + h_min, b + h_min)
+
+        # Start where the ray enters the top ellipsoid, or at the camera when the
+        # camera is already inside it.
+        t0 = top_in if top_in > 0.0 else 0.0
+
+        # End where the ray leaves the top ellipsoid, or earlier where it enters
+        # the bottom ellipsoid in front of the camera. NaN (a miss) compares False.
+        t1 = top_out
+        if bottom_in > 0.0 and bottom_in < t1:
+            t1 = bottom_in
+        if limits[L_T_MAX] < t1:
+            t1 = limits[L_T_MAX]
+
+        return t0, t1
+
+    @jit
     def trace_one(
         hgt: HeightGrid,
         pyr: PyramidData,
@@ -524,19 +632,24 @@ def build_kernels(
         params: GridParams,
         lut_x: GridLut,
         lut_y: GridLut,
+        limits: RayLimits,
         ox: float,
         oy: float,
         oz: float,
         dx: float,
         dy: float,
         dz: float,
-        t_start: float,
-        t_end: float,
-        nseg: int,
         stack: NodeStack,
     ) -> float:
-        # Ray parameter of the first hit of the ECEF ray (ox, oy, oz) + t (dx, dy, dz)
-        # on [t_start, t_end] in nseg segments, or NaN.
+        # Ray parameter of the first hit of the ECEF ray (ox, oy, oz) + t (dx, dy, dz),
+        # t >= 0, or NaN.
+
+        # Clip the ray to the height band. Cut the rest into the fewest equal
+        # segments that are each at most limits[L_SEGMENT] long.
+        t_start, t_end = clip_to_band(ox, oy, oz, dx, dy, dz, params, limits)
+        if not t_end > t_start:
+            return math.nan
+        nseg = int((t_end - t_start) / limits[L_SEGMENT]) + 1
 
         # The raster size in cells.
         rows = shp[0, 0]
@@ -589,6 +702,55 @@ def build_kernels(
 
         return math.nan
 
+    @jit
+    def trace_ray(
+        hgt: HeightGrid,
+        pyr: PyramidData,
+        offs: LevelOffsets,
+        shp: LevelShapes,
+        params: GridParams,
+        lut_x: GridLut,
+        lut_y: GridLut,
+        limits: RayLimits,
+        orig: FloatArray,
+        dirs: FloatArray,
+        r: int | np.int64,
+        stack: NodeStack,
+        out: FloatArray,
+    ) -> None:
+        # Trace ray r of the batch. Write the ray parameter of its hit to out[0, r],
+        # and the latitude, longitude (degrees) and height of the hit point to
+        # out[1:4, r]. A miss gives NaN.
+
+        # orig has one row for each ray, or one row for all the rays.
+        i = min(r, orig.shape[0] - 1)
+        ox = orig[i, 0]
+        oy = orig[i, 1]
+        oz = orig[i, 2]
+        dx = dirs[r, 0]
+        dy = dirs[r, 1]
+        dz = dirs[r, 2]
+        t = trace_one(
+            hgt, pyr, offs, shp, params, lut_x, lut_y, limits, ox, oy, oz, dx, dy, dz, stack
+        )
+
+        # The geodetic coordinates of the hit point.
+        lat = math.nan
+        lon = math.nan
+        h = math.nan
+        if t == t:  # not NaN
+            lat, lon, h = ecef_to_geodetic(
+                ox + t * dx, oy + t * dy, oz + t * dz,
+                params[P_A], params[P_B], params[P_E2], params[P_EP2],
+            )  # fmt: skip
+            lat = math.degrees(lat)
+            lon = math.degrees(lon)
+
+        out[0, r] = t
+        out[1, r] = lat
+        out[2, r] = lon
+        out[3, r] = h
+
     @jit_parallel
     def trace_rays(
         hgt: HeightGrid,
@@ -598,31 +760,24 @@ def build_kernels(
         params: GridParams,
         lut_x: GridLut,
         lut_y: GridLut,
+        limits: RayLimits,
         orig: FloatArray,
         dirs: FloatArray,
-        t0: FloatArray,
-        t1: FloatArray,
-        nseg: IntArray,
-        out_t: FloatArray,
+        out: FloatArray,
     ) -> None:
-        # Ray r is orig[r] + t * dirs[r] on [t0[r], t1[r]] in nseg[r] segments.
-        n = orig.shape[0]
+        # Ray r is orig[r] + t * dirs[r] for t >= 0. The hits go to out[:, r].
+        n = dirs.shape[0]
         size = 4 * shp.shape[0] + 4  # stack_size(num_levels)
 
+        # Each ray has its own traversal stack, so the rays can run in parallel.
+        # The prange index of Numba is unsigned, and Numba mixes unsigned and
+        # signed integers into float64. Thus the index becomes int64.
         for r in prange(n):
-            out_t[r] = math.nan
-            if nseg[r] <= 0:
-                continue
-
-            # Each ray has its own traversal stack, so the rays can run in parallel.
             stack = np.empty((size, 3), np.int64)
-            out_t[r] = trace_one(
-                hgt, pyr, offs, shp, params,
-                lut_x, lut_y,
-                orig[r, 0], orig[r, 1], orig[r, 2],
-                dirs[r, 0], dirs[r, 1], dirs[r, 2],
-                t0[r], t1[r], nseg[r], stack,
-            )  # fmt: skip
+            ray = np.int64(r)
+            trace_ray(
+                hgt, pyr, offs, shp, params, lut_x, lut_y, limits, orig, dirs, ray, stack, out
+            )
 
     return Kernels(
         bilinear_hit=bilinear_hit,
@@ -630,6 +785,9 @@ def build_kernels(
         trace_segment=trace_segment,
         ecef_to_geodetic=ecef_to_geodetic,
         ecef_to_grid=ecef_to_grid,
+        ellipsoid_hits=ellipsoid_hits,
+        clip_to_band=clip_to_band,
         trace_one=trace_one,
+        trace_ray=trace_ray,
         trace_rays=trace_rays,
     )

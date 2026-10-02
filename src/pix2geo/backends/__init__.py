@@ -14,7 +14,7 @@ Backends
     usable. Other batches go to Numba, then CuPy, then Python.
 
 Each backend lives in the module ``<name>_backend``, which has a function
-``trace_rays(terrain, orig, dirs, t0, t1, nseg)`` and optionally
+``trace_rays(terrain, orig, dirs, limits)`` and optionally
 ``check_usable()``, which raises an exception when the backend cannot run.
 
 Set ``PIX2GEO_DISABLE_NUMBA=1`` or ``PIX2GEO_DISABLE_CUPY=1`` to hide a
@@ -32,11 +32,12 @@ import importlib
 import os
 from functools import cache
 from types import ModuleType
-from typing import Literal, TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Literal, cast
 
 import numpy as np
 
-from .._typing import ArrayLike, FloatArray, IntArray
+from .._typing import ArrayLike, FloatArray, RayLimits
+from ._kernel import make_ray_limits
 
 if TYPE_CHECKING:
     from ..terrain import Terrain
@@ -104,23 +105,28 @@ class Backend:
         terrain: Terrain,
         orig: ArrayLike,
         dirs: ArrayLike,
-        t0: ArrayLike,
-        t1: ArrayLike,
-        nseg: ArrayLike,
+        *,
+        max_range: float | None = None,
+        max_segment_length: float = 500.0,
     ) -> FloatArray:
         """Find the first terrain hit on each ray.
 
-        Ray ``r`` is ``orig[r] + t * dirs[r]`` for ``t`` in ``[t0[r], t1[r]]``,
-        cut into ``nseg[r]`` segments (``0`` skips the ray). Returns the ray
-        parameter ``t`` of the first hit, or NaN.
+        Ray ``r`` is ``orig[r] + t * dirs[r]`` for ``t >= 0``, with unit
+        directions ``dirs`` of shape ``(n, 3)``. ``orig`` has the shape
+        ``(n, 3)``, or ``(1, 3)`` for one origin for all the rays. The kernel
+        clips each ray to the height band of the terrain and to ``max_range``.
+        It cuts the rest into equal segments of at most ``max_segment_length``
+        meters.
+
+        Returns a ``(4, n)`` array: the ray parameter ``t`` of the first hit,
+        and the latitude, longitude (degrees) and ellipsoidal height of the
+        hit point. A miss gives NaN in all four rows.
         """
         return self._trace_rays(
             terrain,
             np.ascontiguousarray(orig, dtype=np.float64),
             np.ascontiguousarray(dirs, dtype=np.float64),
-            np.ascontiguousarray(t0, dtype=np.float64),
-            np.ascontiguousarray(t1, dtype=np.float64),
-            np.ascontiguousarray(nseg, dtype=np.int64),
+            make_ray_limits(terrain, max_range, max_segment_length),
         )
 
     def _trace_rays(
@@ -128,11 +134,9 @@ class Backend:
         terrain: Terrain,
         orig: FloatArray,
         dirs: FloatArray,
-        t0: FloatArray,
-        t1: FloatArray,
-        nseg: IntArray,
+        limits: RayLimits,
     ) -> FloatArray:
-        """Subclass hook. The arrays are C-contiguous float64 (``nseg``: int64)."""
+        """Subclass hook. The arrays are C-contiguous float64."""
         raise NotImplementedError
 
     def __repr__(self) -> str:
@@ -159,11 +163,9 @@ class _ModuleBackend(Backend):
         terrain: Terrain,
         orig: FloatArray,
         dirs: FloatArray,
-        t0: FloatArray,
-        t1: FloatArray,
-        nseg: IntArray,
+        limits: RayLimits,
     ) -> FloatArray:
-        return self._module.trace_rays(terrain, orig, dirs, t0, t1, nseg)
+        return self._module.trace_rays(terrain, orig, dirs, limits)
 
 
 class PythonBackend(_ModuleBackend):
@@ -205,11 +207,9 @@ class AutoBackend(Backend):
         terrain: Terrain,
         orig: FloatArray,
         dirs: FloatArray,
-        t0: FloatArray,
-        t1: FloatArray,
-        nseg: IntArray,
+        limits: RayLimits,
     ) -> FloatArray:
-        return self.select(len(orig))._trace_rays(terrain, orig, dirs, t0, t1, nseg)
+        return self.select(len(dirs))._trace_rays(terrain, orig, dirs, limits)
 
 
 _BACKENDS: dict[BackendChoice, type[Backend]] = {

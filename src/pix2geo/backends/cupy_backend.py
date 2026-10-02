@@ -37,8 +37,8 @@ import cupy as cp
 import numpy as np
 from cupyx import jit
 
-from .._typing import FloatArray, IntArray
-from ._kernel import _F, N_PARAMS, Decorator, KernelMath, build_kernels, stack_size
+from .._typing import FloatArray, RayLimits
+from ._kernel import _F, N_LIMITS, N_PARAMS, Decorator, KernelMath, build_kernels, stack_size
 
 if TYPE_CHECKING:
     from ..terrain import Terrain
@@ -51,8 +51,6 @@ CUPY_MATH = cast(
     SimpleNamespace(
         nan=np.float64(math.nan),
         sqrt=cp.sqrt,
-        sin=cp.sin,
-        cos=cp.cos,
         atan2=cp.arctan2,
         degrees=cp.degrees,
         isfinite=cp.isfinite,
@@ -92,7 +90,7 @@ with _quiet_jit():
 # This backend does not use the trace_rays of the shared kernel, because it has
 # a prange loop. The kernel below replaces it.
 kernels = build_kernels(_device_function, _identity, range, CUPY_MATH, cp.float32, cp.int32)
-trace_one = kernels.trace_one
+trace_ray = kernels.trace_ray
 
 
 @_global_function
@@ -104,13 +102,11 @@ def trace_rays_kernel(
     params: cp.ndarray,
     lut_x: cp.ndarray,
     lut_y: cp.ndarray,
+    limits: cp.ndarray,
     orig: cp.ndarray,
     dirs: cp.ndarray,
-    t0: cp.ndarray,
-    t1: cp.ndarray,
-    nseg: cp.ndarray,
     stacks: cp.ndarray,
-    out_t: cp.ndarray,
+    out: cp.ndarray,
 ) -> None:
     # The arguments are those of the shared trace_rays, plus one stack for each
     # thread. Thread tid traces the rays tid, tid + T, tid + 2 T, and so on,
@@ -118,16 +114,8 @@ def trace_rays_kernel(
     tid = jit.grid(1)
     stack = stacks[tid]
 
-    for r in range(tid, orig.shape[0], jit.gridsize(1)):
-        out_t[r] = math.nan
-        if nseg[r] > 0:
-            out_t[r] = trace_one(
-                hgt, pyr, offs, shp, params,
-                lut_x, lut_y,
-                orig[r, 0], orig[r, 1], orig[r, 2],
-                dirs[r, 0], dirs[r, 1], dirs[r, 2],
-                t0[r], t1[r], nseg[r], stack,
-            )  # fmt: skip
+    for r in range(tid, dirs.shape[0], jit.gridsize(1)):
+        trace_ray(hgt, pyr, offs, shp, params, lut_x, lut_y, limits, orig, dirs, r, stack, out)
 
 
 def _stacks(n_threads: int, num_levels: int) -> cp.ndarray:
@@ -154,12 +142,10 @@ def _launch(
     num_levels: int,
     orig: FloatArray,
     dirs: FloatArray,
-    t0: FloatArray,
-    t1: FloatArray,
-    nseg: IntArray,
+    limits: RayLimits,
 ) -> cp.ndarray:
-    """Run the kernel on the device terrain arrays ``dev`` and return the hit parameters."""
-    n = len(orig)
+    """Run the kernel on the device terrain arrays ``dev`` and return the ``(4, n)`` hits."""
+    n = len(dirs)
 
     # One thread for each ray, up to the resident threads of the device. More
     # threads would only wait, and each thread needs a stack.
@@ -167,16 +153,15 @@ def _launch(
     blocks = max(1, min(-(-n // BLOCK), resident // BLOCK))
 
     # The first call with new argument types compiles the kernel.
-    out = cp.empty(n, dtype=cp.float64)
+    out = cp.empty((4, n), dtype=cp.float64)
     with _quiet_jit():
         trace_rays_kernel(
             (blocks,),
             (BLOCK,),
             (
                 dev["hgt"], dev["pyr"], dev["offs"], dev["shp"], dev["params"],
-                dev["lut_x"], dev["lut_y"],
+                dev["lut_x"], dev["lut_y"], cp.asarray(limits),
                 cp.asarray(orig), cp.asarray(dirs),
-                cp.asarray(t0), cp.asarray(t1), cp.asarray(nseg),
                 _stacks(blocks * BLOCK, num_levels), out,
             ),
         )  # fmt: skip
@@ -205,7 +190,7 @@ def check_usable() -> None:
         "lut_y": cp.zeros((2, 2)),
     }
     one_ray = np.zeros((1, 3))
-    _launch(dev, 1, one_ray, one_ray, np.zeros(1), np.zeros(1), np.zeros(1, dtype=np.int64))
+    _launch(dev, 1, one_ray, one_ray, np.zeros(N_LIMITS))
     cp.cuda.Device().synchronize()
 
 
@@ -233,15 +218,13 @@ def trace_rays(
     terrain: Terrain,
     orig: FloatArray,
     dirs: FloatArray,
-    t0: FloatArray,
-    t1: FloatArray,
-    nseg: IntArray,
+    limits: RayLimits,
 ) -> FloatArray:
     """Run the kernel. See :meth:`pix2geo.backends.Backend.trace_rays`."""
-    if len(orig) == 0:
-        return np.empty(0)
+    if len(dirs) == 0:
+        return np.empty((4, 0))
 
     dev = _device_terrain(terrain)
-    out = _launch(dev, terrain.pyramid.num_levels, orig, dirs, t0, t1, nseg)
+    out = _launch(dev, terrain.pyramid.num_levels, orig, dirs, limits)
 
     return cp.asnumpy(out)

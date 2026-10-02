@@ -204,6 +204,35 @@ class CameraIntrinsics:
 
         return xd, yd
 
+    def _distort_with_jacobian(
+        self,
+        x: FloatArray,
+        y: FloatArray,
+    ) -> tuple[FloatArray, FloatArray, FloatArray, FloatArray, FloatArray]:
+        """:meth:`_distort`, and its Jacobian ``[[j11, j12], [j12, j22]]`` (symmetric)."""
+        d = self.dist + (0.0,) * (8 - len(self.dist))
+        k1, k2, p1, p2, k3, k4, k5, k6 = d
+
+        # The radial factor num / den and its derivative with respect to r^2.
+        r2 = x * x + y * y
+        num = 1 + r2 * (k1 + r2 * (k2 + r2 * k3))
+        den = 1 + r2 * (k4 + r2 * (k5 + r2 * k6))
+        radial = num / den
+        d_num = k1 + r2 * (2 * k2 + 3 * k3 * r2)
+        d_den = k4 + r2 * (2 * k5 + 3 * k6 * r2)
+        d_radial = (d_num - radial * d_den) / den
+
+        xy = x * y
+        xd = x * radial + 2 * p1 * xy + p2 * (r2 + 2 * x * x)
+        yd = y * radial + p1 * (r2 + 2 * y * y) + 2 * p2 * xy
+
+        # The partial derivatives. d(r^2)/dx = 2 x and d(r^2)/dy = 2 y.
+        j11 = radial + 2 * x * x * d_radial + 2 * p1 * y + 6 * p2 * x
+        j12 = 2 * xy * d_radial + 2 * p1 * x + 2 * p2 * y
+        j22 = radial + 2 * y * y * d_radial + 6 * p1 * y + 2 * p2 * x
+
+        return xd, yd, j11, j12, j22
+
     def _undistort(
         self,
         xd: FloatArray,
@@ -219,34 +248,29 @@ class CameraIntrinsics:
         # near the image center.
         x = xd.copy()
         y = yd.copy()
-        h = 1e-7
 
         for _ in range(iterations):
             # The error (ex, ey) of the current guess, after distortion.
-            fx_, fy_ = self._distort(x, y)
+            fx_, fy_, j11, j12, j22 = self._distort_with_jacobian(x, y)
             ex = fx_ - xd
             ey = fy_ - yd
             if np.all(np.abs(ex) + np.abs(ey) < 1e-14):
                 break
 
-            # Numerical Jacobian of the distortion model (2x2 for each point).
-            ax, ay = self._distort(x + h, y)
-            bx, by = self._distort(x, y + h)
-            j11 = (ax - fx_) / h
-            j21 = (ay - fy_) / h
-            j12 = (bx - fx_) / h
-            j22 = (by - fy_) / h
-
             # Newton step: solve J (step_x, step_y) = (ex, ey) with the 2x2 inverse.
             # The determinant clamp prevents a division by zero.
-            det = j11 * j22 - j12 * j21
+            det = j11 * j22 - j12 * j12
             det = np.where(np.abs(det) < 1e-12, 1e-12, det)
             x = x - (j22 * ex - j12 * ey) / det
-            y = y - (-j21 * ex + j11 * ey) / det
+            y = y - (j11 * ey - j12 * ex) / det
+        else:
+            # No break: get the error of the last step.
+            fx_, fy_ = self._distort(x, y)
+            ex = fx_ - xd
+            ey = fy_ - yd
 
         # Points that did not converge have no inverse.
-        fx_, fy_ = self._distort(x, y)
-        bad = np.hypot(fx_ - xd, fy_ - yd) > 1e-9
+        bad = np.hypot(ex, ey) > 1e-9
         if np.any(bad):
             x = np.where(bad, np.nan, x)
             y = np.where(bad, np.nan, y)
@@ -274,9 +298,15 @@ class CameraIntrinsics:
         Returns an array of shape ``(..., 3)``.
         """
         # The point (xn, yn, 1) on the z = 1 plane gives the ray direction.
+        # Divide it by its length, and write it into the output in place.
         xn, yn = self.pixel_to_normalized(u, v)
-        rays = np.stack([xn, yn, np.ones_like(xn)], axis=-1)
-        return rays / np.linalg.norm(rays, axis=-1, keepdims=True)
+        inv = 1.0 / np.sqrt(xn * xn + yn * yn + 1.0)
+        rays = np.empty((*inv.shape, 3))
+        np.multiply(xn, inv, out=rays[..., 0])
+        np.multiply(yn, inv, out=rays[..., 1])
+        rays[..., 2] = inv
+
+        return rays
 
     def ray_to_pixel(self, rays: ArrayLike) -> tuple[FloatArray, FloatArray]:
         """Camera-frame directions (or points) to pixel coordinates.

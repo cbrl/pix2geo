@@ -27,6 +27,7 @@ __all__ = [
     "PathLike",
     "PyramidData",
     "RasterSource",
+    "RayLimits",
 ]
 
 #: A file path.
@@ -69,6 +70,10 @@ LevelShapes = NDArray[np.int64]
 #: The packed (lon, lat) to grid mapping, shape ``(N_PARAMS,)``. See
 #: :func:`~pix2geo.backends._kernel.make_grid_params`.
 GridParams = NDArray[np.float64]
+
+#: The ray clip settings of one batch, shape ``(N_LIMITS,)``. See
+#: :func:`~pix2geo.backends._kernel.make_ray_limits`.
+RayLimits = NDArray[np.float64]
 
 #: Grid coordinates (x or y) on a regular lon/lat lattice, for projected CRSs.
 #: A ``(2, 2)`` dummy for geographic rasters.

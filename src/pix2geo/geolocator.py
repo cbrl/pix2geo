@@ -5,19 +5,18 @@ Pipeline
 1. The camera intrinsics turn each pixel into a unit ray in the camera frame.
 2. The camera pose rotates the ray into ECEF. The ray starts at the camera
    ECEF position.
-3. Two ray / ellipsoid intersections clip the ray to the height band of the
-   terrain (``h_min`` to ``h_max``). This removes the empty space above the
-   terrain, which can be hundreds of kilometers for a satellite.
-4. The backend kernel cuts the clipped ray into segments of at most
-   ``max_segment_length`` meters and finds the first intersection with the
-   bilinear terrain surface. See :mod:`pix2geo.backends._kernel`.
-5. The hit parameter maps back onto the exact ECEF ray, and pymap3d
-   converts the hit point to latitude, longitude, and height.
+3. The backend kernel clips each ray to the height band of the terrain
+   (``h_min`` to ``h_max``) and cuts it into segments of at most
+   ``max_segment_length`` meters. It finds the first intersection with the
+   bilinear terrain surface, and converts the hit point to latitude,
+   longitude, and height. See :mod:`pix2geo.backends._kernel`.
+4. Rays that miss can hit a fallback ellipsoid instead.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any
 
 import numpy as np
@@ -30,6 +29,23 @@ from .pose import CameraPose
 from .terrain import Terrain
 
 __all__ = ["GeoResult", "Geolocator", "pixel_to_geo"]
+
+
+@lru_cache(maxsize=2)
+def _image_rays(camera: CameraIntrinsics, step: int) -> FloatArray:
+    """The read-only camera-frame rays of the pixel grid of :meth:`Geolocator.image_to_geo`.
+
+    The rays depend only on the camera and the step, so a video with one
+    camera computes them once. This matters most with lens distortion, where
+    the inversion is the slowest host step. The cache keeps the last two grids.
+    """
+    u = np.arange(0, camera.width, step, dtype=float)
+    v = np.arange(0, camera.height, step, dtype=float)
+    uu, vv = np.meshgrid(u, v)
+    rays = camera.pixel_to_ray(uu, vv)
+    rays.setflags(write=False)
+
+    return rays
 
 
 @dataclass
@@ -145,10 +161,11 @@ class Geolocator:
         if px.ndim == 0 or px.shape[-1] != 2:
             raise ValueError("pixels must have shape (2,) or (..., 2)")
 
+        # The rays have unit length, and they all start at the camera.
         dirs = pose.rays_to_ecef(camera.pixel_to_ray(px[..., 0], px[..., 1]))
-        origin = self.camera_position_ecef(pose)
+        origin = self.camera_position_ecef(pose).reshape(1, 3)
 
-        return self.rays_to_geo(origin, dirs, fallback_height=fallback_height)
+        return self._locate(origin, dirs.reshape(-1, 3), px.shape[:-1], fallback_height)
 
     def image_to_geo(
         self,
@@ -160,13 +177,14 @@ class Geolocator:
     ) -> GeoResult:
         """Geolocate a regular grid of pixels over the whole image.
 
-        The result has shape ``(ceil(height/step), ceil(width/step))``.
+        The result has shape ``(ceil(height/step), ceil(width/step))``. The
+        camera-frame rays of the grid stay in a cache for the next frame.
         """
-        u = np.arange(0, camera.width, step, dtype=float)
-        v = np.arange(0, camera.height, step, dtype=float)
-        pixels = np.stack(np.meshgrid(u, v), axis=-1)
+        rays = _image_rays(camera, int(step))
+        dirs = pose.rays_to_ecef(rays)
+        origin = self.camera_position_ecef(pose).reshape(1, 3)
 
-        return self.pixel_to_geo(camera, pose, pixels, fallback_height=fallback_height)
+        return self._locate(origin, dirs.reshape(-1, 3), rays.shape[:-1], fallback_height)
 
     def rays_to_geo(
         self,
@@ -182,41 +200,19 @@ class Geolocator:
         origin (a camera), and many origins can share one direction (parallel
         rays). ``directions`` does not need unit length.
         """
-        o, d = np.broadcast_arrays(
-            np.asarray(origins, dtype=float),
-            np.asarray(directions, dtype=float),
-        )
-        if d.shape[-1] != 3:
+        o = np.asarray(origins, dtype=float)
+        d = np.asarray(directions, dtype=float)
+        if o.shape[-1:] != (3,) or d.shape[-1:] != (3,):
             raise ValueError("origins and directions must have shape (3,) or (..., 3)")
+        shape = np.broadcast_shapes(o.shape, d.shape)[:-1]
 
-        # Flatten the batch. Unit directions make the ray parameter the range in meters.
-        shape = d.shape[:-1]
-        o = o.reshape(-1, 3)
-        d = d.reshape(-1, 3)
+        # Flatten the batch. One origin stays one row, which all the rays share.
+        # Unit directions make the ray parameter the range in meters.
+        o = o.reshape(1, 3) if o.size == 3 else np.broadcast_to(o, (*shape, 3)).reshape(-1, 3)
+        d = np.broadcast_to(d, (*shape, 3)).reshape(-1, 3)
         d = d / np.linalg.norm(d, axis=1, keepdims=True)
 
-        # Rays that miss the terrain can hit the fallback ellipsoid. A hit
-        # behind the camera (t <= 0) does not count.
-        t_hit = self._trace(o, d)
-        hit = np.isfinite(t_hit)
-        if fallback_height is not None and not hit.all():
-            miss = ~hit
-            t_near, _ = ray_ellipsoid_intersection(o[miss], d[miss], float(fallback_height))
-            t_hit[miss] = np.where(t_near > 0, t_near, np.nan)
-
-        points = o + t_hit[:, None] * d
-        lat, lon, alt = ecef_to_geodetic(points)
-        alt_msl = self._orthometric(lat, lon, alt)
-
-        return GeoResult(
-            lat=lat.reshape(shape),
-            lon=lon.reshape(shape),
-            alt=alt.reshape(shape),
-            ecef=points.reshape((*shape, 3)),
-            range=t_hit.reshape(shape),
-            hit=hit.reshape(shape),
-            alt_msl=None if alt_msl is None else alt_msl.reshape(shape),
-        )
+        return self._locate(o, d, shape, fallback_height)
 
     def geo_to_pixel(
         self,
@@ -253,55 +249,60 @@ class Geolocator:
 
     # ---- Internals ----------------------------------------------------------
 
-    def _clip_to_height_band(self, o: FloatArray, d: FloatArray) -> tuple[FloatArray, FloatArray]:
-        """The ray parameter interval ``[t0, t1]`` inside the height band of the terrain.
+    def _locate(
+        self,
+        o: FloatArray,
+        d: FloatArray,
+        shape: tuple[int, ...],
+        fallback_height: float | None,
+    ) -> GeoResult:
+        """Geolocate the flat rays ``o + t d``, and give the result the batch ``shape``.
 
-        The band is the shell between the ellipsoids grown by ``h_min - 1``
-        and ``h_max + 1``. The interval ends where the ray first enters the
-        lower ellipsoid. A ray that misses the band gets NaN.
+        ``d`` has unit rows. ``o`` has one row for each ray, or one row for all.
         """
-        top_in, top_out = ray_ellipsoid_intersection(o, d, self.terrain.h_max + 1.0)
-        bottom_in, _ = ray_ellipsoid_intersection(o, d, self.terrain.h_min - 1.0)
+        # The kernel gives the ray parameter and the geodetic coordinates of each hit.
+        t_hit, lat, lon, alt = self._trace(o, d)
+        hit = np.isfinite(t_hit)
 
-        # Start where the ray enters the top ellipsoid, or at the camera when the
-        # camera is already inside it.
-        t0 = np.fmax(top_in, 0.0)
+        # Rays that miss the terrain can hit the fallback ellipsoid. A hit
+        # behind the camera (t <= 0) does not count.
+        if fallback_height is not None and not hit.all():
+            miss = np.flatnonzero(~hit)
+            o_miss = np.broadcast_to(o, d.shape)[miss]
+            t_near, _ = ray_ellipsoid_intersection(o_miss, d[miss], float(fallback_height))
+            t_hit[miss] = np.where(t_near > 0, t_near, np.nan)
+            points = o_miss + t_hit[miss, None] * d[miss]
+            lat[miss], lon[miss], alt[miss] = ecef_to_geodetic(points)
 
-        # End where the ray leaves the top ellipsoid, or earlier where it enters
-        # the bottom ellipsoid in front of the camera.
-        t1 = np.where(bottom_in > 0, np.fmin(top_out, bottom_in), top_out)
+        points = o + t_hit[:, None] * d
+        alt_msl = self._orthometric(lat, lon, alt)
 
-        if self.max_range is not None:
-            t1 = np.fmin(t1, self.max_range)
-
-        return t0, t1
+        return GeoResult(
+            lat=lat.reshape(shape),
+            lon=lon.reshape(shape),
+            alt=alt.reshape(shape),
+            ecef=points.reshape((*shape, 3)),
+            range=t_hit.reshape(shape),
+            hit=hit.reshape(shape),
+            alt_msl=None if alt_msl is None else alt_msl.reshape(shape),
+        )
 
     def _trace(self, o: FloatArray, d: FloatArray) -> FloatArray:
-        """Ray parameter of the first terrain hit (NaN for a miss)."""
-        t_hit = np.full(len(o), np.nan)
-        t0, t1 = self._clip_to_height_band(o, d)
-
-        # Only rays with a non-empty interval go to the backend.
-        rays = np.flatnonzero(t1 > t0)  # NaN compares False
-
-        # The fewest equal segments that are each at most max_segment_length long.
-        n_seg = np.maximum(np.ceil((t1[rays] - t0[rays]) / self.max_segment_length), 1)
-        n_seg = n_seg.astype(np.int64)
-
-        # Batches limit the memory of each backend call.
-        for start in range(0, rays.size, self.batch_size):
-            part = slice(start, start + self.batch_size)
-            batch = rays[part]
-            t_hit[batch] = self.backend.trace_rays(
+        """The ``(4, n)`` hits of the backend: ``t``, latitude, longitude and height."""
+        # Batches limit the memory of each backend call. An empty batch also
+        # makes one call, so the result always comes from the backend.
+        batches = [
+            self.backend.trace_rays(
                 self.terrain,
-                o[batch],
-                d[batch],
-                t0[batch],
-                t1[batch],
-                n_seg[part],
+                o if len(o) == 1 else o[start : start + self.batch_size],
+                d[start : start + self.batch_size],
+                max_range=self.max_range,
+                max_segment_length=self.max_segment_length,
             )
+            for start in range(0, max(len(d), 1), self.batch_size)
+        ]
 
-        return t_hit
+        return batches[0] if len(batches) == 1 else np.concatenate(batches, axis=1)
 
     def _orthometric(self, lat: FloatArray, lon: FloatArray, alt: FloatArray) -> FloatArray | None:
         """Heights above the terrain geoid, or None when the terrain has no geoid."""

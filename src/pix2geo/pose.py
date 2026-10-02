@@ -17,13 +17,14 @@ Frames and conventions
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Literal, Union, get_args
 
 import numpy as np
-import pymap3d
 from scipy.spatial.transform import Rotation
 
+from ._geodesy import geodetic_to_ecef
 from ._typing import ArrayLike, FloatArray
 
 if TYPE_CHECKING:
@@ -73,11 +74,20 @@ def euler_rotation(yaw: float, pitch: float, roll: float, degrees: bool = True) 
 
 def ned_to_ecef_matrix(lat: float, lon: float) -> FloatArray:
     """3x3 matrix whose columns are the N, E, D unit vectors in ECEF."""
-    # Write each NED axis as an ENU vector. pymap3d.enu2uvw rotates it into ECEF.
-    ned_axes_in_enu = [(0.0, 1.0, 0.0), (1.0, 0.0, 0.0), (0.0, 0.0, -1.0)]
-    columns = [pymap3d.enu2uvw(e, n, u, lat, lon) for e, n, u in ned_axes_in_enu]
+    phi = math.radians(lat)
+    lam = math.radians(lon)
+    sp, cp = math.sin(phi), math.cos(phi)
+    sl, cl = math.sin(lam), math.cos(lam)
 
-    return np.array(columns, dtype=float).T
+    # North is the latitude direction and east is the longitude direction.
+    # Down is the inward ellipsoid normal.
+    return np.array(
+        [
+            [-sp * cl, -sl, -cp * cl],
+            [-sp * sl, cl, -cp * sl],
+            [cp, 0.0, -sp],
+        ]
+    )
 
 
 def _as_rotation(rotation: RotationLike) -> Rotation:
@@ -214,12 +224,16 @@ class CameraPose:
 
         Both altitudes are heights above the WGS84 ellipsoid.
         """
-        # The target in local NED at the camera. Yaw is the bearing to the target.
-        # Pitch is the elevation angle, positive up, so it uses -d.
-        n, e, d = pymap3d.geodetic2ned(target_lat, target_lon, target_alt, lat, lon, alt)
-        yaw = np.degrees(np.arctan2(e, n))
-        pitch = np.degrees(np.arctan2(-d, np.hypot(n, e)))
-        r = roll if degrees else np.degrees(roll)
+        # The target in local NED at the camera. Row vectors: v @ R is the same
+        # as R.T @ v, the rotation from ECEF to NED.
+        vec = geodetic_to_ecef(target_lat, target_lon, target_alt) - geodetic_to_ecef(lat, lon, alt)
+        n, e, d = vec @ ned_to_ecef_matrix(lat, lon)
+
+        # Yaw is the bearing to the target. Pitch is the elevation angle,
+        # positive up, so it uses -d.
+        yaw = math.degrees(math.atan2(e, n))
+        pitch = math.degrees(math.atan2(-d, math.hypot(n, e)))
+        r = roll if degrees else math.degrees(roll)
 
         return cls.from_euler(lat, lon, alt, yaw, pitch, r)
 
