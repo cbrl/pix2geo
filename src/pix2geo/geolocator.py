@@ -239,11 +239,16 @@ class Geolocator:
         u, v = camera.ray_to_pixel(vec_cam)
         visible = (vec_cam[..., 2] > 0) & camera.contains(u, v)
 
-        # Cast a ray to each point. A terrain hit before the point blocks it.
+        # Cast a ray only to the points in view. A terrain hit before the
+        # point blocks it. The flat array is a view of `blocked`.
         if check_occlusion and np.any(visible):
-            first = self.rays_to_geo(cam, vec)
-            blocked = first.hit & (first.range < np.linalg.norm(vec, axis=-1) - tolerance)
-            visible &= ~blocked
+            idx = np.flatnonzero(visible)
+            vec_in = vec.reshape(-1, 3)[idx]
+            first = self.rays_to_geo(cam, vec_in)
+            blocked = np.zeros(np.shape(visible), dtype=bool)
+            flat = blocked.reshape(-1)
+            flat[idx] = first.hit & (first.range < np.linalg.norm(vec_in, axis=-1) - tolerance)
+            visible = visible & ~blocked
 
         return u, v, visible
 
