@@ -156,7 +156,7 @@ class PyprojGeoid(GeoidModel):
         from pyproj import CRS, Transformer
 
         if network:
-            pyproj.network.set_network_enabled(True)
+            pyproj.network.set_network_enabled(True) # type: ignore[attr-defined]
 
         vcrs = CRS.from_user_input(vertical_crs)
         code = vcrs.to_epsg()

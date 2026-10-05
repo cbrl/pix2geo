@@ -18,7 +18,9 @@ dependencies = [
 
 [project.optional-dependencies]
 numba = ["numba>=0.57"]
-cuda = ["cupy-cuda12x>=12"]
+# CuPy has one wheel for each CUDA major version.
+cuda12 = ["cupy-cuda12x>=12"]
+cuda13 = ["cupy-cuda13x>=13.6"]
 test = ["pytest>=7"]
 dev = ["pix2geo[test]", "ruff>=0.6", "mypy>=1.10"]
 
