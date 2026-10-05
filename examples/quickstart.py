@@ -80,9 +80,9 @@ def main() -> None:
         ]
     )
     res = geo.pixel_to_geo(cam, pose, pixels)
-    print(f"\n{'pixel':>16} {'lat':>12} {'lon':>13} {'alt [m]':>9} {'range [m]':>10}")
+    print(f"\n{'pixel':>16} {'lat':>12} {'lon':>12} {'alt [m]':>9} {'range [m]':>10}")
     for (u, v), la, lo, al, rg in zip(pixels, res.lat, res.lon, res.alt, res.range):
-        print(f"({u:6.1f},{v:6.1f}) {la:12.7f} {lo:13.7f} {al:9.2f} {rg:10.1f}")
+        print(f"({u:6.1f},{v:6.1f}) {la:12.7f} {lo:12.7f} {al:9.2f} {rg:10.1f}")
 
     # Project the hits back into the image: this checks the round trip.
     u, v, visible = geo.geo_to_pixel(cam, pose, res.lat, res.lon, res.alt)

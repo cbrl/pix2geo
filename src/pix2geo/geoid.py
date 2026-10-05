@@ -31,7 +31,11 @@ __all__ = [
 ]
 
 
-_NAMED_GEOIDS = {"egm96": "EPSG:5773", "egm2008": "EPSG:3855", "egm08": "EPSG:3855"}
+_NAMED_GEOIDS = {
+    "egm96": "EPSG:5773",
+    "egm2008": "EPSG:3855",
+    "egm08": "EPSG:3855",
+}
 
 
 @runtime_checkable
@@ -156,7 +160,7 @@ class PyprojGeoid(GeoidModel):
         from pyproj import CRS, Transformer
 
         if network:
-            pyproj.network.set_network_enabled(True)
+            pyproj.network.set_network_enabled(True) # type: ignore[attr-defined]
 
         vcrs = CRS.from_user_input(vertical_crs)
         code = vcrs.to_epsg()

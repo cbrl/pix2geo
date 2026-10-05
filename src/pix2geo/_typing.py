@@ -45,8 +45,10 @@ CRSLike = Any
 
 #: A float64 array.
 FloatArray = NDArray[np.float64]
+
 #: An int64 array.
 IntArray = NDArray[np.int64]
+
 #: A boolean array.
 BoolArray = NDArray[np.bool_]
 

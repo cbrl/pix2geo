@@ -60,8 +60,7 @@ def geodetic_to_ecef(lat: ArrayLike, lon: ArrayLike, alt: ArrayLike) -> FloatArr
     )
     shape = lat.shape
 
-    # The steps work in place. On a large batch, each new array costs more
-    # than a multiplication.
+    # The steps work in place using a preallocated output array.
     out = np.empty((*shape, 3))
 
     # The sine and cosine of the latitude, from t = tan(lat / 2).
@@ -118,7 +117,7 @@ def _point_to_ecef(lat: float, lon: float, h: float) -> tuple[float, float, floa
 
 
 def ecef_to_geodetic(points: ArrayLike) -> tuple[FloatArray, FloatArray, FloatArray]:
-    """ECEF points ``(..., 3)`` to WGS84 latitude, longitude (degrees) and height (m).
+    """ECEF points ``(..., 3)`` to WGS84 latitude, longitude (degrees), and height (m).
 
     This is Bowring's method with two iterations, as in the kernel. The error
     is below 1e-8 m from 500 m below the surface up to 1000 km above it.
@@ -147,7 +146,10 @@ def ecef_to_geodetic(points: ArrayLike) -> tuple[FloatArray, FloatArray, FloatAr
     sl, cl = num * inv, den * inv
     h = r * cl + z * sl - WGS84_A * np.sqrt(1.0 - WGS84_E2 * sl * sl)
 
-    return np.degrees(np.arctan2(num, den)), np.degrees(np.arctan2(y, x)), h
+    lat = np.degrees(np.arctan2(num, den))
+    lon = np.degrees(np.arctan2(y, x))
+
+    return lat, lon, h
 
 
 def ray_ellipsoid_intersection(
