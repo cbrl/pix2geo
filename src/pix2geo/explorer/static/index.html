@@ -1,0 +1,322 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pix2geo explorer</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ccircle cx='8' cy='8' r='6' fill='none' stroke='%232f6fed' stroke-width='2.5'/%3E%3Ccircle cx='8' cy='8' r='2.2' fill='%23eb6834'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/static/style.css">
+<script>
+  // The theme that the viewer chose last time, before the first paint.
+  try {
+    const theme = localStorage.getItem('pix2geo-theme');
+    if (theme === 'light' || theme === 'dark') document.documentElement.dataset.theme = theme;
+  } catch {}
+</script>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.min.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+  }
+}
+</script>
+<script type="module" src="/static/main.js"></script>
+</head>
+<body>
+<svg class="sprite" aria-hidden="true">
+  <symbol id="i-link" viewBox="0 0 24 24"><path d="M10 13.5a4.5 4.5 0 0 0 6.4.4l2.8-2.8a4.5 4.5 0 0 0-6.4-6.4l-1.2 1.2"/><path d="M14 10.5a4.5 4.5 0 0 0-6.4-.4l-2.8 2.8a4.5 4.5 0 0 0 6.4 6.4l1.2-1.2"/></symbol>
+  <symbol id="i-term" viewBox="0 0 24 24"><path d="m5 7 5 5-5 5M12.5 17H19"/></symbol>
+  <symbol id="i-theme" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M12 3.5a8.5 8.5 0 0 1 0 17Z" fill="currentColor"/></symbol>
+  <symbol id="i-help" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M9.6 9.4a2.5 2.5 0 0 1 4.8.9c0 1.7-2.4 2.1-2.4 3.7M12 17.2h.01"/></symbol>
+  <symbol id="i-max" viewBox="0 0 24 24"><path d="M14.5 4H20v5.5M9.5 20H4v-5.5M20 4l-6.5 6.5M4 20l6.5-6.5"/></symbol>
+  <symbol id="i-down" viewBox="0 0 24 24"><path d="M12 4v11m-4.5-4.5L12 15l4.5-4.5M5 20h14"/></symbol>
+</svg>
+
+<canvas id="gl"></canvas>
+
+<div id="app">
+  <header id="top">
+    <div class="brand">
+      <svg class="logo" viewBox="0 0 16 16"><circle cx="8" cy="8" r="6"/><circle cx="8" cy="8" r="2.2"/></svg>
+      pix2geo <span>explorer</span>
+    </div>
+    <div id="terrainInfo" class="ellipsis"></div>
+    <div class="spacer"></div>
+    <div id="perf"></div>
+    <button id="btnLink" class="ghost" title="Copy a link that restores this view"><svg class="i"><use href="#i-link"/></svg>Copy link</button>
+    <button id="btnCli" class="ghost" title="Copy the pix2geo command that casts the picks"><svg class="i"><use href="#i-term"/></svg>Copy command</button>
+    <button id="btnTheme" class="ghost icon" title="Light or dark theme"><svg class="i"><use href="#i-theme"/></svg></button>
+    <button id="btnHelp" class="ghost icon" title="Controls (?)"><svg class="i"><use href="#i-help"/></svg></button>
+  </header>
+
+  <aside id="side">
+    <details open>
+      <summary>Pose</summary>
+      <div class="grid2">
+        <label class="field"><span>Lat</span><input type="number" id="lat" step="0.0001"></label>
+        <label class="field"><span>Lon</span><input type="number" id="lon" step="0.0001"></label>
+        <label class="field"><span>Alt</span><input type="number" id="alt" step="10"><i>m</i></label>
+        <select id="altRef" title="The reference of the altitude">
+          <option value="agl">above the DEM</option>
+          <option value="ellipsoid">above the ellipsoid</option>
+          <option value="geoid">above the geoid</option>
+        </select>
+      </div>
+      <div class="slider"><span>Yaw</span><input type="range" id="yaw" min="-180" max="180" step="0.1"><label class="field"><input type="number" data-for="yaw" step="0.1"><i>°</i></label></div>
+      <div class="slider"><span>Pitch</span><input type="range" id="pitch" min="-90" max="90" step="0.1"><label class="field"><input type="number" data-for="pitch" step="0.1"><i>°</i></label></div>
+      <div class="slider"><span>Roll</span><input type="range" id="roll" min="-180" max="180" step="0.1"><label class="field"><input type="number" data-for="roll" step="0.1"><i>°</i></label></div>
+      <div class="buttons fill">
+        <button id="btnNadir" title="Look straight down">Nadir</button>
+        <button id="btnLevel" title="Pitch and roll to zero">Level</button>
+        <button id="btnSpin" title="Turn the camera slowly (Space)">Spin</button>
+        <button id="btnResetPose" title="Back to the start pose">Reset</button>
+      </div>
+    </details>
+
+    <details open>
+      <summary>Camera</summary>
+      <div class="grid2">
+        <label class="field" title="Image width"><span>W</span><input type="number" id="camW" min="16" max="20000" step="1"><i>px</i></label>
+        <label class="field" title="Image height"><span>H</span><input type="number" id="camH" min="16" max="20000" step="1"><i>px</i></label>
+      </div>
+      <div class="slider"><span>HFOV</span><input type="range" id="hfov" min="1" max="170" step="0.1"><label class="field"><input type="number" data-for="hfov" step="0.1"><i>°</i></label></div>
+      <div class="grid2" title="The camera matrix K, in pixels">
+        <label class="field"><span>fx</span><input type="number" id="fx" step="1"></label>
+        <label class="field"><span>fy</span><input type="number" id="fy" step="1"></label>
+        <label class="field"><span>cx</span><input type="number" id="cx" step="0.5"></label>
+        <label class="field"><span>cy</span><input type="number" id="cy" step="0.5"></label>
+      </div>
+      <details class="sub">
+        <summary>Distortion</summary>
+        <div class="grid2" id="distInputs"></div>
+        <div class="buttons">
+          <button id="btnDistZero">None</button>
+          <button id="btnDistBarrel" title="An example of barrel distortion">Barrel</button>
+        </div>
+      </details>
+      <div class="buttons"><button id="btnResetCam" title="Back to the start camera">Reset</button></div>
+    </details>
+
+    <details open>
+      <summary>Rays</summary>
+      <div class="slider" title="The number of rays in the fan over the image"><span>Fan</span><input type="range" id="rayCount" min="0" max="2000" step="1"><label class="field"><input type="number" data-for="rayCount" step="1"></label></div>
+      <label class="check"><input type="checkbox" id="showMisses">Show the rays that miss</label>
+      <label class="check"><input type="checkbox" id="showDots">Show the fan in the camera view</label>
+      <div class="check-row" title="An ellipsoidal height. The rays that miss the DEM land on this surface.">
+        <label class="check"><input type="checkbox" id="fallbackOn">Fallback surface</label>
+        <label class="field"><input type="number" id="fallbackH" step="10"><i>m</i></label>
+      </div>
+    </details>
+
+    <details open>
+      <summary>Terrain</summary>
+      <div class="grid2">
+        <select id="extent" title="The terrain that the 3D view draws">
+          <option value="all">Whole DEM</option>
+          <option value="view">Near the view</option>
+        </select>
+        <select id="meshSize" title="The largest number of posts along one side">
+          <option value="256">256 posts</option>
+          <option value="512">512 posts</option>
+          <option value="768">768 posts</option>
+          <option value="1024">1024 posts</option>
+        </select>
+      </div>
+      <div class="info-row"><span id="meshInfo" class="note"></span><button id="btnReloadTerrain" class="ghost" title="Load the terrain again, for example around a new view">Reload</button></div>
+      <div class="slider" title="Vertical exaggeration"><span>Vertical</span><input type="range" id="ve" min="1" max="10" step="0.1"><label class="field"><input type="number" data-for="ve" step="0.1"><i>×</i></label></div>
+      <div class="grid2">
+        <select id="colorMode" title="Terrain color">
+          <option value="0">Height colors</option>
+          <option value="1">Shaded relief</option>
+          <option value="2">Slope colors</option>
+        </select>
+        <select id="contour" title="Contour interval">
+          <option value="0">No contours</option>
+          <option value="10">10 m contours</option>
+          <option value="25">25 m contours</option>
+          <option value="50">50 m contours</option>
+          <option value="100">100 m contours</option>
+          <option value="250">250 m contours</option>
+        </select>
+      </div>
+      <label class="check"><input type="checkbox" id="graticule">Latitude and longitude lines</label>
+      <div class="slider" title="The sun azimuth, clockwise from north"><span>Sun az.</span><input type="range" id="sunAz" min="0" max="360" step="1"><label class="field"><input type="number" data-for="sunAz" step="1"><i>°</i></label></div>
+      <div class="slider" title="The sun elevation above the horizon"><span>Sun elev.</span><input type="range" id="sunEl" min="2" max="90" step="1"><label class="field"><input type="number" data-for="sunEl" step="1"><i>°</i></label></div>
+    </details>
+
+    <details open>
+      <summary>Camera view</summary>
+      <div class="pair">
+        <select id="layer" title="A pix2geo layer over the camera view">
+          <option value="none">No layer</option>
+          <option value="render">Ray-cast render</option>
+          <option value="range">Slant range</option>
+          <option value="height">Hit height</option>
+          <option value="gsd">Ground sample distance</option>
+          <option value="sensitivity">DEM error sensitivity</option>
+          <option value="status">Misses and fallback</option>
+        </select>
+        <select id="layerStep" title="One ray for each cell of this many pixels">
+          <option value="2">2 px</option>
+          <option value="4">4 px</option>
+          <option value="8">8 px</option>
+          <option value="16">16 px</option>
+        </select>
+      </div>
+      <div class="slider"><span>Opacity</span><input type="range" id="layerOpacity" min="0" max="1" step="0.01"><label class="field"><input type="number" data-for="layerOpacity" step="0.05"></label></div>
+      <div id="layerInfo" class="note"></div>
+      <label class="check"><input type="checkbox" id="showHorizon">Ellipsoid horizon</label>
+      <div class="buttons">
+        <button id="btnPhoto" title="Show a photo over the camera view. You can also drop it on the view.">Photo…</button>
+        <button id="btnPhotoSize" title="Set the camera size to the photo size" hidden>Use its size</button>
+        <button id="btnPhotoClear" hidden>Remove</button>
+      </div>
+      <div class="slider" id="photoRow" hidden><span>Photo</span><input type="range" id="photoOpacity" min="0" max="1" step="0.01"><label class="field"><input type="number" data-for="photoOpacity" step="0.05"></label></div>
+    </details>
+
+    <details open>
+      <summary>Coverage</summary>
+      <label class="check"><input type="checkbox" id="viewshed">Shade the terrain that the camera cannot see</label>
+      <div class="pair">
+        <select id="drape" title="An image on the terrain">
+          <option value="0">No drape</option>
+          <option value="1">Drape the camera image</option>
+          <option value="2">Drape a pixel grid</option>
+        </select>
+        <select id="gridPx" title="The pixel grid spacing">
+          <option value="25">25 px</option>
+          <option value="50">50 px</option>
+          <option value="100">100 px</option>
+          <option value="200">200 px</option>
+        </select>
+      </div>
+      <label class="check"><input type="checkbox" id="frustumImage">Image in the frustum</label>
+      <div id="coverageInfo" class="note"></div>
+    </details>
+
+    <details>
+      <summary>Engine</summary>
+      <label class="field wide"><span>Backend</span><select id="backend"></select></label>
+      <div class="grid2">
+        <label class="field" title="The longest ray segment"><span>Segment</span><input type="number" id="segment" min="1" step="10"><i>m</i></label>
+        <label class="field"><span>Range</span><input type="number" id="maxRange" min="0" step="1" placeholder="any"><i>km</i></label>
+      </div>
+      <div class="buttons"><button id="btnBench" title="Time a full frame of the camera on each backend">Benchmark</button></div>
+    </details>
+
+    <details>
+      <summary>Session</summary>
+      <div class="buttons">
+        <button id="btnSave" title="Save the pose, the camera, the picks and the settings">Save</button>
+        <button id="btnLoad" title="Open a session file">Open…</button>
+      </div>
+    </details>
+  </aside>
+
+  <section id="view3d" class="view">
+    <div class="view-body" id="body3d"></div>
+    <div class="toolbar">
+      <span class="title glass">3D scene</span>
+      <div class="spacer"></div>
+      <div class="seg glass">
+        <button data-view3d="fit" title="Show the camera and its footprint">Fit</button>
+        <button data-view3d="top" title="Look straight down">Top</button>
+        <button data-view3d="chase" title="Look from behind the camera">Behind</button>
+      </div>
+      <button class="icon glass" data-max="3d" title="Maximize"><svg class="i"><use href="#i-max"/></svg></button>
+    </div>
+  </section>
+
+  <section id="viewpov" class="view">
+    <div class="view-body" id="bodypov">
+      <canvas id="overlay"></canvas>
+      <div id="hud" class="chip glass"></div>
+      <div id="legend" class="chip glass" hidden></div>
+      <div id="tip" hidden></div>
+      <div id="dropHint" hidden>Drop an image or a session file</div>
+    </div>
+    <div class="toolbar">
+      <span class="title glass">Camera view</span>
+      <div class="spacer"></div>
+      <span id="zoomInfo" class="title glass" hidden></span>
+      <button id="btnZoomFit" class="glass" title="Show the whole image" hidden>Fit</button>
+      <button class="icon glass" data-max="pov" title="Maximize"><svg class="i"><use href="#i-max"/></svg></button>
+    </div>
+  </section>
+
+  <section id="detail">
+    <div class="panel-head">
+      <span class="title">Picks</span><span id="pickCount" class="count"></span>
+      <div class="spacer"></div>
+      <button id="btnMeasure" class="ghost" title="Connect the picks in order. Measure the path and the area.">Measure</button>
+      <button id="btnCsv" class="ghost" title="Download the picks as CSV"><svg class="i"><use href="#i-down"/></svg>CSV</button>
+      <button id="btnGeojson" class="ghost" title="Download the picks and the footprint as GeoJSON"><svg class="i"><use href="#i-down"/></svg>GeoJSON</button>
+      <button id="btnClear" class="ghost" title="Remove all the picks">Clear</button>
+    </div>
+    <div class="detail-scroll">
+      <div id="pickTable"></div>
+      <div id="measureInfo"></div>
+      <div id="pickDetail" hidden>
+        <div id="pickHead" class="pick-head"></div>
+        <div class="profile-wrap"><canvas id="profile"></canvas><div id="profileTip" hidden></div></div>
+        <p id="profileNote" class="warn" hidden></p>
+        <dl id="pickFacts" class="facts"></dl>
+      </div>
+    </div>
+  </section>
+</div>
+
+<div id="toasts" aria-live="polite"></div>
+
+<dialog id="helpDlg">
+  <h2>Controls</h2>
+  <div class="help-cols">
+    <section>
+      <h3>Camera view</h3>
+      <dl>
+        <dt>Click</dt><dd>Pick a pixel and cast its ray</dd>
+        <dt>Drag a pick</dt><dd>Move it</dd>
+        <dt>Right-drag</dt><dd>Turn the camera</dd>
+        <dt>Wheel</dt><dd>Zoom (Shift: field of view)</dd>
+        <dt>Drag</dt><dd>Pan, when zoomed</dd>
+        <dt>Drop a file</dt><dd>Show a photo, or open a session</dd>
+      </dl>
+    </section>
+    <section>
+      <h3>3D scene</h3>
+      <dl>
+        <dt>Drag</dt><dd>Orbit (right-drag: pan, wheel: zoom)</dd>
+        <dt>Click</dt><dd>Find the terrain point in the camera. A visible point becomes a pick.</dd>
+        <dt>Alt+click</dt><dd>Aim the camera at the point</dd>
+        <dt>Shift+click</dt><dd>Move the camera above the point</dd>
+      </dl>
+    </section>
+    <section>
+      <h3>Keyboard</h3>
+      <dl>
+        <dt>W A S D</dt><dd>Move</dd>
+        <dt>R F</dt><dd>Up and down</dd>
+        <dt>← → ↑ ↓</dt><dd>Yaw and pitch</dd>
+        <dt>Q E</dt><dd>Roll</dd>
+        <dt>Shift</dt><dd>Five times faster</dd>
+        <dt>Space</dt><dd>Spin</dd>
+        <dt>[ ]</dt><dd>Previous or next pick</dd>
+        <dt>Delete</dt><dd>Remove the selected pick</dd>
+      </dl>
+    </section>
+  </div>
+  <p class="note">The camera view is a WebGL render of the drawn terrain. All the numbers come from pix2geo on the full DEM. The ray-cast render layer shows the pix2geo result.</p>
+  <form method="dialog"><button>Close</button></form>
+</dialog>
+
+<dialog id="benchDlg">
+  <h2>Backend benchmark</h2>
+  <p class="note">One full frame of the camera, best of two runs. The Python backend uses a pixel step that gives about 5,000 rays.</p>
+  <div id="benchBody"></div>
+  <form method="dialog"><button>Close</button></form>
+</dialog>
+
+<input type="file" id="fileInput" hidden accept="image/*,.json,application/json">
+</body>
+</html>

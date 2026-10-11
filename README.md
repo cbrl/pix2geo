@@ -192,11 +192,12 @@ segment. The geodetic math stays float64, as ECEF coordinates in float32 have po
 ## Accuracy
 
 - Straight segments in grid space approximate the slightly curved image of a straight ECEF line.
-  The height error is at most `L**2 / (8 R)`, which comes out to 5 mm for `L = 500 m`. The range
+  The height error is at most `L^2 / (8 R)`, which comes out to 5 mm for `L = 500 m`. The range
   error is the height error divided by the sine of the grazing angle. Make `max_segment_length`
   smaller for very shallow rays.
 - The geodetic conversion (Bowring's method, in the kernel and on the host) is within 1e-10 degrees
-  and 1 µm in height of the exact coordinates, from 500 m below the surface to 1000 km above it (tested).
+  and 1 µm in height of the exact coordinates, from 500 m below the surface to 1000 km above it
+  (tested).
 - The conversion from geodetic coordinates to ECEF is within 1e-8 m of PROJ (tested).
 - The projected-CRS lookup table agrees with pyproj to better than 0.001 pixel (tested).
 - The grown-ellipsoid clipping errs by less than 3 cm for heights below 20 km. The clip band has a
@@ -234,3 +235,24 @@ pix2geo --dem n40_w106_1arc_v3.tif --geoid egm96 --radius 30 \
 
 `--radius` reads only the DEM within that many kilometers of the camera. Run `pix2geo --help` to
 see all the options.
+
+## Interactive explorer
+
+`pix2geo.explorer` starts an interactive web app that shows the terrain, the camera, its frustum,
+and the raycasts (in 3D and from the 2D camera POV).
+
+*__Note__: This app has been AI-generated with little validation beyond basic testing.*
+
+```bash
+python -m pix2geo.explorer dem.tif --geoid egm96 --yaw 250 --pitch -15
+python -m pix2geo.explorer                    # a synthetic DEM
+pix2geo-explorer dem.tif --dist -0.2 0.05 0 0 # the same command after pip install
+```
+
+```python
+from pix2geo.explorer import serve
+
+serve(geo, cam, pose)                         # opens the browser; Ctrl+C stops the server
+server = serve(geo, cam, pose, block=False)   # for a notebook; server.shutdown() stops it
+```
+The page loads three.js from jsDelivr, so the browser needs a network connection.

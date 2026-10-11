@@ -1,17 +1,4 @@
-"""Digital elevation model loading and grid coordinate conversion.
-
-Surface model
--------------
-The terrain surface is the bilinear interpolation of the elevation posts.
-The posts sit at the raster pixel centers. Grid coordinates ``(x, y)`` are
-fractional (column, row) indices with integer values at pixel centers. A
-*cell* ``(i, j)`` is the square between the four posts ``(i, j)``,
-``(i, j+1)``, ``(i+1, j)`` and ``(i+1, j+1)``. A raster with ``R x C`` posts
-has ``(R-1) x (C-1)`` cells. A cell with a nodata post is a hole.
-
-All heights inside a :class:`Terrain` are WGS84 ellipsoidal heights. The
-loader adds the geoid undulation to orthometric (MSL) source data.
-"""
+"""Digital elevation model loading and grid coordinate conversion."""
 
 from __future__ import annotations
 
@@ -84,10 +71,17 @@ class Terrain:
         on each axis and interpolated between. The geoid is smooth, so this
         loses no accuracy and saves time on large rasters.
 
-    The terrain arrays (:attr:`heights`, the quadtree and the grid mapping)
-    are read-only. The quadtree, the height range and the GPU copies come
-    from the heights, so a change to the heights would make them wrong.
-    Make a new :class:`Terrain` for new heights.
+    Surface model
+    -------------
+    The terrain surface is the bilinear interpolation of the elevation posts.
+    The posts sit at the raster pixel centers. Grid coordinates ``(x, y)`` are
+    fractional (column, row) indices with integer values at pixel centers. A
+    *cell* ``(i, j)`` is the square between the four posts ``(i, j)``,
+    ``(i, j+1)``, ``(i+1, j)`` and ``(i+1, j+1)``. A raster with ``R x C`` posts
+    has ``(R-1) x (C-1)`` cells. A cell with a nodata post is a hole.
+
+    All heights inside a :class:`Terrain` are WGS84 ellipsoidal heights. The
+    loader adds the geoid undulation to orthometric (MSL) source data.
     """
 
     #: Largest lookup table size on each axis (projected CRSs only).

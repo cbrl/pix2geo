@@ -26,12 +26,17 @@ dev = ["pix2geo[test]", "ruff>=0.6", "mypy>=1.10"]
 
 [project.scripts]
 pix2geo = "pix2geo.cli:main"
+pix2geo-explorer = "pix2geo.explorer.__main__:main"
 
 [tool.setuptools.dynamic]
 version = { attr = "pix2geo.__version__" }
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+# The page of the interactive explorer.
+"pix2geo.explorer" = ["static/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

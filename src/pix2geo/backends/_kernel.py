@@ -12,15 +12,13 @@ compile. The function :func:`build_kernels` makes the kernel with a given
 
 Algorithm
 ---------
-Each ray is an exact straight line in ECEF. The kernel clips it to the
-height band of the terrain (two ray / ellipsoid intersections) and cuts the
-rest into equal segments (see :func:`make_ray_limits`). For each segment,
-the kernel:
+Each ray is a straight line in ECEF. The kernel clips it to the height band of
+the terrain (two ray / ellipsoid intersections) and cuts the rest into equal
+segments (see :func:`make_ray_limits`). For each segment, the kernel:
 
 1. Converts the segment end point from ECEF to geodetic coordinates
-   (Bowring's method, two iterations, sub-micrometre accurate near the
-   Earth surface), then to raster grid coordinates ``(x, y)``. The third
-   grid coordinate ``z`` is the ellipsoidal height.
+   (Bowring's method, two iterations), then to raster grid coordinates
+   ``(x, y)``. The third grid coordinate ``z`` is the ellipsoidal height.
 2. Walks the max quadtree (:class:`~pix2geo.quadtree.HeightPyramid`) for the
    grid-space segment, depth-first and near-to-far:
 
@@ -34,10 +32,9 @@ The visit order is near-to-far, so the first leaf hit is the nearest hit.
 The kernel maps the hit back onto the exact ECEF ray parameter, and converts
 the hit point to geodetic coordinates.
 
-Step 1 uses float64. Step 2 uses the number types ``real`` and ``index``
-that the backend gives (float32 and int32 on the GPU), with grid coordinates
-relative to a grid point near the segment start. Small coordinates keep the
-float32 error small, also on large rasters.
+Step 2 uses grid coordinates relative to a grid point near the segment start,
+which keeps the coordinates small. This enables GPU backends to use 32-bit
+numeric types for significant speed gains compared to 64-bit types.
 
 Grid mapping
 ------------
@@ -249,11 +246,8 @@ def build_kernels(
     the kernel code reads as plain Python.
 
     ``real`` and ``index`` are the float and integer types of the quadtree
-    walk (``trace_segment`` and ``bilinear_hit``). The CPU backends use
-    ``float`` and ``int`` (64 bits). The CuPy backend uses float32 and int32,
-    because consumer GPUs run 64-bit math much more slowly. The integer
-    arrays of the walk (``shp`` and ``stack``) should have the type
-    ``index`` too. The geodetic math always uses float64.
+    walk (``trace_segment`` and ``bilinear_hit``). CPU and GPU backends use
+    different types due to speed constraints on GPUs.
     """
 
     @jit
